@@ -306,8 +306,20 @@ const WatermarkSelector = ({
       if (bestMatch) {
         const finalImgX = searchX + bestMatch.x;
         const finalImgY = searchY + bestMatch.y;
-        const newStart = { x: finalImgX / scaleX, y: finalImgY / scaleY };
-        const newCurrent = { x: (finalImgX + bestSize) / scaleX, y: (finalImgY + bestSize) / scaleY };
+
+        // 偵測到的浮水印中心點（螢幕座標）
+        const detectedCenterX = (finalImgX + bestSize / 2) / scaleX;
+        const detectedCenterY = (finalImgY + bestSize / 2) / scaleY;
+
+        // 保留使用者原本框選的寬高，只把中心移到偵測位置
+        // 這樣框框不會因為 bestSize/scale 換算而變大
+        const origW = Math.abs(current.x - start.x);
+        const origH = Math.abs(current.y - start.y);
+        const halfW = origW / 2;
+        const halfH = origH / 2;
+
+        const newStart = { x: detectedCenterX - halfW, y: detectedCenterY - halfH };
+        const newCurrent = { x: detectedCenterX + halfW, y: detectedCenterY + halfH };
         startPosRef.current = newStart;
         currentPosRef.current = newCurrent;
         setStartPos(newStart);

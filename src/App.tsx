@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Download, RefreshCw, Image as ImageIcon, Sparkles, ShieldCheck, Zap, Code, ArrowRight, CheckCircle2, AlertCircle, X, SplitSquareHorizontal, Settings } from 'lucide-react';
+import { Upload, Download, RefreshCw, Image as ImageIcon, Sparkles, ShieldCheck, Zap, Code, ArrowRight, CheckCircle2, AlertCircle, X, SplitSquareHorizontal, Settings, Crop } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { mask48, mask96 } from './masks';
 
@@ -104,10 +104,140 @@ const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: n
   ctx.putImageData(imgData, x0, y0);
 };
 
+const WatermarkSelector = ({ 
+  image, 
+  onConfirm, 
+  onCancel 
+}: { 
+  image: ProcessedImage; 
+  onConfirm: (config: WatermarkConfig) => void; 
+  onCancel: () => void; 
+}) => {
+  const [startPos, setStartPos] = useState<{x: number, y: number} | null>(null);
+  const [currentPos, setCurrentPos] = useState<{x: number, y: number} | null>(null);
+  const [isDrawing, setIsDrawing] = useState(false);
+  const imgRef = useRef<HTMLImageElement>(null);
+
+  const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    setStartPos({ x, y });
+    setCurrentPos({ x, y });
+    setIsDrawing(true);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!isDrawing) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+    const y = Math.max(0, Math.min(e.clientY - rect.top, rect.height));
+    setCurrentPos({ x, y });
+  };
+
+  const handleMouseUp = () => {
+    setIsDrawing(false);
+  };
+
+  const handleConfirm = () => {
+    if (!startPos || !currentPos || !imgRef.current || !image.width || !image.height) return;
+
+    const rect = imgRef.current.getBoundingClientRect();
+    const scaleX = image.width / rect.width;
+    const scaleY = image.height / rect.height;
+
+    const x = Math.min(startPos.x, currentPos.x) * scaleX;
+    const y = Math.min(startPos.y, currentPos.y) * scaleY;
+    const w = Math.abs(currentPos.x - startPos.x) * scaleX;
+    const h = Math.abs(currentPos.y - startPos.y) * scaleY;
+
+    // Force square based on max dimension
+    const size = Math.max(w, h);
+    // Center the square on the drawn rectangle
+    const centerX = x + w / 2;
+    const centerY = y + h / 2;
+    const squareX = centerX - size / 2;
+    const squareY = centerY - size / 2;
+
+    const marginRight = image.width - (squareX + size);
+    const marginBottom = image.height - (squareY + size);
+
+    onConfirm({ 
+      size: Math.round(size), 
+      marginRight: Math.round(marginRight), 
+      marginBottom: Math.round(marginBottom) 
+    });
+  };
+
+  const selectionStyle = startPos && currentPos ? {
+    left: Math.min(startPos.x, currentPos.x),
+    top: Math.min(startPos.y, currentPos.y),
+    width: Math.abs(currentPos.x - startPos.x),
+    height: Math.abs(currentPos.y - startPos.y),
+  } : {};
+
+  return (
+    <div className="fixed inset-0 z-[100] bg-slate-900/95 backdrop-blur-sm flex flex-col">
+      <div className="h-16 border-b border-white/10 flex items-center justify-between px-6 shrink-0">
+        <h3 className="text-white font-medium flex items-center gap-2">
+          <Crop className="w-5 h-5" />
+          手動框選浮水印位置
+        </h3>
+        <button onClick={onCancel} className="text-white/60 hover:text-white p-2">
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+      
+      <div className="flex-1 overflow-hidden flex items-center justify-center p-6 select-none">
+        <div 
+          className="relative inline-block cursor-crosshair shadow-2xl"
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+          onMouseLeave={handleMouseUp}
+        >
+          <img 
+            ref={imgRef}
+            src={image.originalUrl} 
+            alt="Select watermark" 
+            className="max-w-full max-h-[calc(100vh-12rem)] w-auto h-auto block pointer-events-none"
+            draggable={false}
+          />
+          {startPos && currentPos && (
+            <div 
+              className="absolute border-2 border-red-500 bg-red-500/20 pointer-events-none"
+              style={selectionStyle}
+            />
+          )}
+        </div>
+      </div>
+
+      <div className="h-20 border-t border-white/10 flex items-center justify-center gap-4 shrink-0 bg-slate-900">
+        <span className="text-white/60 text-sm mr-4 hidden sm:inline">請在上方圖片中，按住滑鼠拖曳出浮水印的範圍</span>
+        <button 
+          onClick={onCancel}
+          className="px-6 py-2.5 rounded-xl font-medium text-white hover:bg-white/10 transition-colors"
+        >
+          取消
+        </button>
+        <button 
+          onClick={handleConfirm}
+          disabled={!startPos || !currentPos || Math.abs(currentPos.x - startPos.x) < 5}
+          className="px-6 py-2.5 rounded-xl font-medium bg-red-600 hover:bg-red-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+        >
+          <CheckCircle2 className="w-4 h-4" />
+          確認框選
+        </button>
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
   const [images, setImages] = useState<ProcessedImage[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [adjustingId, setAdjustingId] = useState<string | null>(null);
+  const [selectingImage, setSelectingImage] = useState<ProcessedImage | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -519,6 +649,17 @@ export default function App() {
                                     />
                                   </div>
                                 </div>
+                                
+                                <button 
+                                  onClick={() => {
+                                    setSelectingImage(img);
+                                    setAdjustingId(null);
+                                  }}
+                                  className="w-full py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-colors mt-2"
+                                >
+                                  <Crop className="w-4 h-4" />
+                                  手動框選浮水印
+                                </button>
                               </div>
                             )}
 
@@ -621,6 +762,19 @@ export default function App() {
           </p>
         </div>
       </footer>
+
+      {/* Selection Modal */}
+      {selectingImage && (
+        <WatermarkSelector 
+          image={selectingImage}
+          onConfirm={(config) => {
+            updateImageConfig(selectingImage.id, config);
+            setSelectingImage(null);
+            setAdjustingId(selectingImage.id); // Re-open adjusting panel to show new values
+          }}
+          onCancel={() => setSelectingImage(null)}
+        />
+      )}
     </div>
   );
 }

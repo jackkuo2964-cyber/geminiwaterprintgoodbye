@@ -185,10 +185,9 @@ const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: n
 
   ctx.putImageData(imgData, x0, y0);
 };
-
 // ─────────────────────────────────────────────
-// WatermarkSelector：支援滑鼠 & 觸控框選
-// 用 useRef 追蹤繪製狀態，避免 async handler 的 stale closure 問題
+// WatermarkSelector：塗抹模式 + 自動鎖定浮水印
+// 用手指/滑鼠塗抹，放開後自動偵測最佳浮水印位置
 // ─────────────────────────────────────────────
 const WatermarkSelector = ({ 
   image, 
@@ -199,19 +198,28 @@ const WatermarkSelector = ({
   onConfirm: (config: WatermarkConfig) => void; 
   onCancel: () => void; 
 }) => {
-  const [startPos, setStartPos] = useState<{x: number, y: number} | null>(null);
-  const [currentPos, setCurrentPos] = useState<{x: number, y: number} | null>(null);
+  const [brushSize, setBrushSize] = useState(24);
   const [isDetecting, setIsDetecting] = useState(false);
-
-  // 用 ref 追蹤即時值，避免 async 函式裡讀到 stale state
+  const [lockedBox, setLockedBox] = useState<{x: number, y: number, w: number, h: number} | null>(null);
+  const confirmedConfigRef = useRef<WatermarkConfig | null>(null);
   const isDrawing = useRef(false);
-  const startPosRef = useRef<{x: number, y: number} | null>(null);
-  const currentPosRef = useRef<{x: number, y: number} | null>(null);
-
+  const strokePointsRef = useRef<{x: number, y: number}[]>([]);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // 取得相對於容器的座標（滑鼠 & 觸控共用）
+  useEffect(() => {
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
+    const sync = () => {
+      canvas.width = img.offsetWidth;
+      canvas.height = img.offsetHeight;
+    };
+    if (img.complete) sync();
+    else img.onload = sync;
+  }, []);
+
   const getRelativePos = (clientX: number, clientY: number) => {
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return null;
@@ -221,33 +229,50 @@ const WatermarkSelector = ({
     };
   };
 
+  const paintPoint = (x: number, y: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.45)';
+    ctx.beginPath();
+    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    ctx.fill();
+  };
+
   const handlePointerDown = (clientX: number, clientY: number) => {
     const pos = getRelativePos(clientX, clientY);
     if (!pos) return;
+    setLockedBox(null);
+    confirmedConfigRef.current = null;
+    strokePointsRef.current = [pos];
     isDrawing.current = true;
-    startPosRef.current = pos;
-    currentPosRef.current = pos;
-    setStartPos(pos);
-    setCurrentPos(pos);
+    paintPoint(pos.x, pos.y);
   };
 
   const handlePointerMove = (clientX: number, clientY: number) => {
     if (!isDrawing.current) return;
     const pos = getRelativePos(clientX, clientY);
     if (!pos) return;
-    currentPosRef.current = pos;
-    setCurrentPos(pos);
+    strokePointsRef.current.push(pos);
+    paintPoint(pos.x, pos.y);
   };
 
   const handlePointerUp = async () => {
     if (!isDrawing.current) return;
     isDrawing.current = false;
 
-    const start = startPosRef.current;
-    const current = currentPosRef.current;
+    const points = strokePointsRef.current;
+    if (points.length === 0 || !imgRef.current || !image.width || !image.height) return;
 
-    if (!start || !current || !imgRef.current || !image.width || !image.height) return;
-    if (Math.abs(current.x - start.x) < 20 || Math.abs(current.y - start.y) < 20) return;
+    const minX = Math.min(...points.map(p => p.x)) - brushSize / 2;
+    const minY = Math.min(...points.map(p => p.y)) - brushSize / 2;
+    const maxX = Math.max(...points.map(p => p.x)) + brushSize / 2;
+    const maxY = Math.max(...points.map(p => p.y)) + brushSize / 2;
+    const bboxW = maxX - minX;
+    const bboxH = maxY - minY;
+
+    if (bboxW < 5 && bboxH < 5) return;
 
     setIsDetecting(true);
     try {
@@ -255,20 +280,16 @@ const WatermarkSelector = ({
       const scaleX = image.width / rect.width;
       const scaleY = image.height / rect.height;
 
-      const x = Math.min(start.x, current.x) * scaleX;
-      const y = Math.min(start.y, current.y) * scaleY;
-      const w = Math.abs(current.x - start.x) * scaleX;
-      const h = Math.abs(current.y - start.y) * scaleY;
+      const pad = 40;
+      const searchX = Math.max(0, Math.floor(minX * scaleX - pad));
+      const searchY = Math.max(0, Math.floor(minY * scaleY - pad));
+      const searchW = Math.min(image.width - searchX, Math.ceil(bboxW * scaleX + pad * 2));
+      const searchH = Math.min(image.height - searchY, Math.ceil(bboxH * scaleY + pad * 2));
 
-      const searchX = Math.max(0, Math.floor(x - 30));
-      const searchY = Math.max(0, Math.floor(y - 30));
-      const searchW = Math.min(image.width - searchX, Math.ceil(w + 60));
-      const searchH = Math.min(image.height - searchY, Math.ceil(h + 60));
-
-      const canvas = document.createElement('canvas');
-      canvas.width = searchW;
-      canvas.height = searchH;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const offscreen = document.createElement('canvas');
+      offscreen.width = searchW;
+      offscreen.height = searchH;
+      const ctx = offscreen.getContext('2d', { willReadFrequently: true });
       if (!ctx) return;
 
       ctx.drawImage(imgRef.current, searchX, searchY, searchW, searchH, 0, 0, searchW, searchH);
@@ -288,56 +309,56 @@ const WatermarkSelector = ({
       if (match48 && match96) {
         const score48 = match48.score / (48 * 48);
         const score96 = match96.score / (96 * 96);
-        if (score96 > score48) {
-          bestMatch = match96;
-          bestSize = 96;
-        } else {
-          bestMatch = match48;
-          bestSize = 48;
-        }
+        if (score96 > score48) { bestMatch = match96; bestSize = 96; }
+        else { bestMatch = match48; bestSize = 48; }
       } else if (match48) {
-        bestMatch = match48;
-        bestSize = 48;
+        bestMatch = match48; bestSize = 48;
       } else if (match96) {
-        bestMatch = match96;
-        bestSize = 96;
+        bestMatch = match96; bestSize = 96;
       }
 
       if (bestMatch) {
         const finalImgX = searchX + bestMatch.x;
         const finalImgY = searchY + bestMatch.y;
 
-        // 偵測到的浮水印中心點（螢幕座標）
-        const detectedCenterX = (finalImgX + bestSize / 2) / scaleX;
-        const detectedCenterY = (finalImgY + bestSize / 2) / scaleY;
+        setLockedBox({
+          x: finalImgX / scaleX,
+          y: finalImgY / scaleY,
+          w: bestSize / scaleX,
+          h: bestSize / scaleY,
+        });
 
-        // 保留使用者原本框選的寬高，只把中心移到偵測位置
-        // 這樣框框不會因為 bestSize/scale 換算而變大
-        const origW = Math.abs(current.x - start.x);
-        const origH = Math.abs(current.y - start.y);
-        const halfW = origW / 2;
-        const halfH = origH / 2;
-
-        const newStart = { x: detectedCenterX - halfW, y: detectedCenterY - halfH };
-        const newCurrent = { x: detectedCenterX + halfW, y: detectedCenterY + halfH };
-        startPosRef.current = newStart;
-        currentPosRef.current = newCurrent;
-        setStartPos(newStart);
-        setCurrentPos(newCurrent);
+        confirmedConfigRef.current = {
+          size: Math.round(bestSize),
+          marginRight: Math.round(image.width - (finalImgX + bestSize)),
+          marginBottom: Math.round(image.height - (finalImgY + bestSize)),
+        };
       }
     } catch (e) {
-      console.error("Auto-detect failed", e);
+      console.error('Auto-detect failed', e);
     } finally {
       setIsDetecting(false);
     }
   };
 
-  // Mouse events
+  const clearCanvas = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    strokePointsRef.current = [];
+    setLockedBox(null);
+    confirmedConfigRef.current = null;
+  };
+
+  const handleConfirm = () => {
+    if (!confirmedConfigRef.current) return;
+    onConfirm(confirmedConfigRef.current);
+  };
+
   const handleMouseDown = (e: React.MouseEvent<HTMLDivElement>) => handlePointerDown(e.clientX, e.clientY);
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => handlePointerMove(e.clientX, e.clientY);
   const handleMouseUp = () => handlePointerUp();
 
-  // Touch events（preventDefault 防止頁面捲動干擾）
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     e.preventDefault();
     handlePointerDown(e.touches[0].clientX, e.touches[0].clientY);
@@ -351,60 +372,46 @@ const WatermarkSelector = ({
     handlePointerUp();
   };
 
-  const handleConfirm = () => {
-    const start = startPosRef.current;
-    const current = currentPosRef.current;
-    if (!start || !current || !imgRef.current || !image.width || !image.height) return;
-
-    const rect = imgRef.current.getBoundingClientRect();
-    const scaleX = image.width / rect.width;
-    const scaleY = image.height / rect.height;
-
-    const x = Math.min(start.x, current.x) * scaleX;
-    const y = Math.min(start.y, current.y) * scaleY;
-    const w = Math.abs(current.x - start.x) * scaleX;
-    const h = Math.abs(current.y - start.y) * scaleY;
-
-    const size = Math.max(w, h);
-    const centerX = x + w / 2;
-    const centerY = y + h / 2;
-    const squareX = centerX - size / 2;
-    const squareY = centerY - size / 2;
-
-    const marginRight = image.width - (squareX + size);
-    const marginBottom = image.height - (squareY + size);
-
-    onConfirm({ 
-      size: Math.round(size), 
-      marginRight: Math.round(marginRight), 
-      marginBottom: Math.round(marginBottom) 
-    });
-  };
-
-  const selectionStyle = startPos && currentPos ? {
-    left: Math.min(startPos.x, currentPos.x),
-    top: Math.min(startPos.y, currentPos.y),
-    width: Math.abs(currentPos.x - startPos.x),
-    height: Math.abs(currentPos.y - startPos.y),
-  } : {};
+  const cursorSvg = `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='${brushSize}' height='${brushSize}' viewBox='0 0 ${brushSize} ${brushSize}'%3E%3Ccircle cx='${brushSize/2}' cy='${brushSize/2}' r='${brushSize/2-1}' fill='rgba(239,68,68,0.4)' stroke='rgba(239,68,68,0.9)' stroke-width='1.5'/%3E%3C/svg%3E`;
 
   return (
     <div className="fixed inset-0 z-[100] bg-slate-900/95 backdrop-blur-sm flex flex-col">
-      <div className="h-16 border-b border-white/10 flex items-center justify-between px-6 shrink-0">
+      <div className="h-14 border-b border-white/10 flex items-center justify-between px-6 shrink-0">
         <h3 className="text-white font-medium flex items-center gap-2">
           <Crop className="w-5 h-5" />
-          手動框選浮水印位置
+          塗抹浮水印位置
         </h3>
         <button onClick={onCancel} className="text-white/60 hover:text-white p-2">
           <X className="w-5 h-5" />
         </button>
       </div>
-      
-      <div className="flex-1 overflow-hidden flex items-center justify-center p-6 select-none">
-        {/* touch-none：告訴瀏覽器把所有 touch 事件交給 JS，防止 iOS 捲動干擾 */}
-        <div 
+
+      <div className="border-b border-white/10 px-6 py-3 flex items-center gap-4 shrink-0 bg-slate-900">
+        <span className="text-white/60 text-xs whitespace-nowrap">筆刷</span>
+        <input
+          type="range"
+          min="8" max="80" step="2"
+          value={brushSize}
+          onChange={e => setBrushSize(parseInt(e.target.value))}
+          className="flex-1 accent-red-500"
+        />
+        <div
+          className="rounded-full bg-red-500/50 border-2 border-red-400 shrink-0"
+          style={{ width: Math.max(brushSize, 8), height: Math.max(brushSize, 8) }}
+        />
+        <button
+          onClick={clearCanvas}
+          className="text-xs text-white/50 hover:text-white px-3 py-1.5 rounded-lg border border-white/10 hover:border-white/30 transition-colors whitespace-nowrap"
+        >
+          清除重畫
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-hidden flex items-center justify-center p-4 select-none">
+        <div
           ref={containerRef}
-          className="relative inline-block cursor-crosshair shadow-2xl touch-none"
+          className="relative inline-block shadow-2xl touch-none"
+          style={{ cursor: `url("${cursorSvg}") ${brushSize/2} ${brushSize/2}, crosshair` }}
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
@@ -413,48 +420,67 @@ const WatermarkSelector = ({
           onTouchMove={handleTouchMove}
           onTouchEnd={handleTouchEnd}
         >
-          <img 
+          <img
             ref={imgRef}
-            src={image.originalUrl} 
-            alt="Select watermark" 
-            className="max-w-full max-h-[calc(100vh-12rem)] w-auto h-auto block pointer-events-none"
+            src={image.originalUrl}
+            alt="塗抹浮水印"
+            className="max-w-full max-h-[calc(100vh-17rem)] w-auto h-auto block pointer-events-none"
             draggable={false}
           />
-          {startPos && currentPos && (
-            <div 
-              className="absolute border-2 border-red-500 bg-red-500/20 pointer-events-none"
-              style={selectionStyle}
-            />
+          <canvas
+            ref={canvasRef}
+            className="absolute inset-0 pointer-events-none"
+            style={{ width: '100%', height: '100%' }}
+          />
+          {lockedBox && (
+            <div
+              className="absolute pointer-events-none border-2 border-emerald-400 shadow-[0_0_0_1px_rgba(0,0,0,0.5)]"
+              style={{
+                left: lockedBox.x,
+                top: lockedBox.y,
+                width: lockedBox.w,
+                height: lockedBox.h,
+              }}
+            >
+              <span className="absolute -top-5 left-0 text-emerald-400 text-[10px] font-bold bg-black/70 px-1.5 py-0.5 rounded whitespace-nowrap">
+                ✓ 已鎖定浮水印
+              </span>
+            </div>
           )}
         </div>
       </div>
 
-      <div className="h-20 border-t border-white/10 flex items-center justify-center gap-4 shrink-0 bg-slate-900">
-        <span className="text-white/60 text-sm mr-4 hidden sm:inline">
-          {isDetecting ? '正在自動鎖定浮水印...' : '請在上方圖片中，按住拖曳出浮水印的範圍'}
+      <div className="border-t border-white/10 flex items-center px-6 shrink-0 bg-slate-900 py-3 gap-4">
+        <span className="text-white/50 text-xs flex-1 hidden sm:block">
+          {isDetecting
+            ? '正在自動鎖定浮水印...'
+            : lockedBox
+            ? '綠框為偵測到的浮水印，確認後套用去除'
+            : '用手指塗抹浮水印的大概位置，放開後自動鎖定'}
         </span>
-        <button 
+        <button
           onClick={onCancel}
-          className="px-6 py-2.5 rounded-xl font-medium text-white hover:bg-white/10 transition-colors"
+          className="px-5 py-2.5 rounded-xl font-medium text-white hover:bg-white/10 transition-colors"
         >
           取消
         </button>
-        <button 
+        <button
           onClick={handleConfirm}
-          disabled={!startPos || !currentPos || Math.abs((currentPos?.x ?? 0) - (startPos?.x ?? 0)) < 5 || isDetecting}
-          className="px-6 py-2.5 rounded-xl font-medium bg-red-600 hover:bg-red-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          disabled={!lockedBox || isDetecting}
+          className="px-5 py-2.5 rounded-xl font-medium bg-red-600 hover:bg-red-500 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
         >
           {isDetecting ? (
             <RefreshCw className="w-4 h-4 animate-spin" />
           ) : (
             <CheckCircle2 className="w-4 h-4" />
           )}
-          確認框選
+          確認去除
         </button>
       </div>
     </div>
   );
 };
+
 
 export default function App() {
   const [images, setImages] = useState<ProcessedImage[]>([]);

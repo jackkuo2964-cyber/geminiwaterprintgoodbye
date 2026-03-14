@@ -52,6 +52,98 @@ const loadMaskData = async (base64: string, size: number): Promise<ImageData> =>
   });
 };
 
+const findBestMatch = (
+  imgData: ImageData, 
+  maskData: Uint8ClampedArray, 
+  maskSize: number
+) => {
+  let bestScore = -Infinity;
+  let bestX = 0;
+  let bestY = 0;
+
+  const w = imgData.width;
+  const h = imgData.height;
+
+  if (w < maskSize || h < maskSize) return null;
+
+  const step = 2;
+
+  for (let y = 0; y <= h - maskSize; y += step) {
+    for (let x = 0; x <= w - maskSize; x += step) {
+      
+      let localSum = 0;
+      let localCount = 0;
+      for (let my = 0; my < maskSize; my += step) {
+        for (let mx = 0; mx < maskSize; mx += step) {
+          const imgIdx = ((y + my) * w + (x + mx)) * 4;
+          localSum += (imgData.data[imgIdx] + imgData.data[imgIdx+1] + imgData.data[imgIdx+2]) / 3;
+          localCount++;
+        }
+      }
+      const localMean = localSum / localCount;
+
+      let score = 0;
+      for (let my = 0; my < maskSize; my += step) {
+        for (let mx = 0; mx < maskSize; mx += step) {
+          const maskIdx = (my * maskSize + mx) * 4;
+          const maskAlpha = maskData[maskIdx] / 255.0;
+          if (maskAlpha > 0.05) {
+            const imgIdx = ((y + my) * w + (x + mx)) * 4;
+            const brightness = (imgData.data[imgIdx] + imgData.data[imgIdx+1] + imgData.data[imgIdx+2]) / 3;
+            score += (brightness - localMean) * maskAlpha;
+          }
+        }
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  // Refine
+  let refinedBestScore = -Infinity;
+  let refinedBestX = bestX;
+  let refinedBestY = bestY;
+  
+  for (let y = Math.max(0, bestY - step); y <= Math.min(h - maskSize, bestY + step); y++) {
+    for (let x = Math.max(0, bestX - step); x <= Math.min(w - maskSize, bestX + step); x++) {
+      let localSum = 0;
+      let localCount = 0;
+      for (let my = 0; my < maskSize; my++) {
+        for (let mx = 0; mx < maskSize; mx++) {
+          const imgIdx = ((y + my) * w + (x + mx)) * 4;
+          localSum += (imgData.data[imgIdx] + imgData.data[imgIdx+1] + imgData.data[imgIdx+2]) / 3;
+          localCount++;
+        }
+      }
+      const localMean = localSum / localCount;
+
+      let score = 0;
+      for (let my = 0; my < maskSize; my++) {
+        for (let mx = 0; mx < maskSize; mx++) {
+          const maskIdx = (my * maskSize + mx) * 4;
+          const maskAlpha = maskData[maskIdx] / 255.0;
+          if (maskAlpha > 0.05) {
+            const imgIdx = ((y + my) * w + (x + mx)) * 4;
+            const brightness = (imgData.data[imgIdx] + imgData.data[imgIdx+1] + imgData.data[imgIdx+2]) / 3;
+            score += (brightness - localMean) * maskAlpha;
+          }
+        }
+      }
+      if (score > refinedBestScore) {
+        refinedBestScore = score;
+        refinedBestX = x;
+        refinedBestY = y;
+      }
+    }
+  }
+
+  return { x: refinedBestX, y: refinedBestY, score: refinedBestScore };
+};
+
 // 反向 Alpha 混合演算法 (Reverse Alpha Compositing)
 // 這是最完美的去浮水印方式。Gemini 的浮水印通常是半透明的白色或特定顏色。
 // 假設浮水印顏色為 W (通常是白色 255,255,255)，透明度為 alpha (例如 0.15)
@@ -59,9 +151,9 @@ const loadMaskData = async (base64: string, size: number): Promise<ImageData> =>
 // 反向推導：Original = (Result - W * alpha) / (1 - alpha)
 const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: number, height: number, config?: WatermarkConfig) => {
   // 根據圖片尺寸判斷浮水印大小與邊距
-  // W <= 1024 or H <= 1024 -> 48x48, 32px margin
-  // W > 1024 and H > 1024 -> 96x96, 64px margin
-  const isLarge = width > 1024 && height > 1024;
+  // 只有 1536x1536 或更大的正方形/接近正方形的圖片才會使用 96x96 浮水印
+  // 1080x1920 (9:16) 或 1920x1080 (16:9) 皆使用 48x48 浮水印
+  const isLarge = width >= 1536 && height >= 1536;
   const watermarkSize = config?.size ?? (isLarge ? 96 : 48);
   const marginRight = config?.marginRight ?? (isLarge ? 64 : 32);
   const marginBottom = config?.marginBottom ?? (isLarge ? 64 : 32);
@@ -135,8 +227,89 @@ const WatermarkSelector = ({
     setCurrentPos({ x, y });
   };
 
-  const handleMouseUp = () => {
+  const [isDetecting, setIsDetecting] = useState(false);
+
+  const handleMouseUp = async () => {
     setIsDrawing(false);
+    
+    if (!startPos || !currentPos || !imgRef.current || !image.width || !image.height) return;
+
+    // Only auto-detect if the drawn box is reasonably sized (e.g., > 20px)
+    if (Math.abs(currentPos.x - startPos.x) < 20 || Math.abs(currentPos.y - startPos.y) < 20) return;
+
+    setIsDetecting(true);
+
+    try {
+      const rect = imgRef.current.getBoundingClientRect();
+      const scaleX = image.width / rect.width;
+      const scaleY = image.height / rect.height;
+
+      const x = Math.min(startPos.x, currentPos.x) * scaleX;
+      const y = Math.min(startPos.y, currentPos.y) * scaleY;
+      const w = Math.abs(currentPos.x - startPos.x) * scaleX;
+      const h = Math.abs(currentPos.y - startPos.y) * scaleY;
+
+      const searchX = Math.max(0, Math.floor(x - 30));
+      const searchY = Math.max(0, Math.floor(y - 30));
+      const searchW = Math.min(image.width - searchX, Math.ceil(w + 60));
+      const searchH = Math.min(image.height - searchY, Math.ceil(h + 60));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = searchW;
+      canvas.height = searchH;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return;
+
+      ctx.drawImage(imgRef.current, searchX, searchY, searchW, searchH, 0, 0, searchW, searchH);
+      const imgData = ctx.getImageData(0, 0, searchW, searchH);
+
+      const mask48Data = await loadMaskData(mask48, 48);
+      const mask96Data = await loadMaskData(mask96, 96);
+
+      // Run detection in a timeout to allow UI to show "Detecting..." state if needed
+      await new Promise(resolve => setTimeout(resolve, 10));
+
+      const match48 = findBestMatch(imgData, mask48Data.data, 48);
+      const match96 = findBestMatch(imgData, mask96Data.data, 96);
+
+      let bestMatch = null;
+      let bestSize = 48;
+
+      if (match48 && match96) {
+        const score48 = match48.score / (48 * 48);
+        const score96 = match96.score / (96 * 96);
+        if (score96 > score48) {
+          bestMatch = match96;
+          bestSize = 96;
+        } else {
+          bestMatch = match48;
+          bestSize = 48;
+        }
+      } else if (match48) {
+        bestMatch = match48;
+        bestSize = 48;
+      } else if (match96) {
+        bestMatch = match96;
+        bestSize = 96;
+      }
+
+      if (bestMatch) {
+        const finalImgX = searchX + bestMatch.x;
+        const finalImgY = searchY + bestMatch.y;
+        
+        const screenX = finalImgX / scaleX;
+        const screenY = finalImgY / scaleY;
+        const screenW = bestSize / scaleX;
+        const screenH = bestSize / scaleY;
+
+        setStartPos({ x: screenX, y: screenY });
+        setCurrentPos({ x: screenX + screenW, y: screenY + screenH });
+      }
+    } catch (e) {
+      console.error("Auto-detect failed", e);
+    } finally {
+      setIsDetecting(false);
+    }
   };
 
   const handleConfirm = () => {
@@ -213,7 +386,9 @@ const WatermarkSelector = ({
       </div>
 
       <div className="h-20 border-t border-white/10 flex items-center justify-center gap-4 shrink-0 bg-slate-900">
-        <span className="text-white/60 text-sm mr-4 hidden sm:inline">請在上方圖片中，按住滑鼠拖曳出浮水印的範圍</span>
+        <span className="text-white/60 text-sm mr-4 hidden sm:inline">
+          {isDetecting ? '正在自動鎖定浮水印...' : '請在上方圖片中，按住滑鼠拖曳出浮水印的範圍'}
+        </span>
         <button 
           onClick={onCancel}
           className="px-6 py-2.5 rounded-xl font-medium text-white hover:bg-white/10 transition-colors"
@@ -222,10 +397,14 @@ const WatermarkSelector = ({
         </button>
         <button 
           onClick={handleConfirm}
-          disabled={!startPos || !currentPos || Math.abs(currentPos.x - startPos.x) < 5}
+          disabled={!startPos || !currentPos || Math.abs(currentPos.x - startPos.x) < 5 || isDetecting}
           className="px-6 py-2.5 rounded-xl font-medium bg-red-600 hover:bg-red-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
         >
-          <CheckCircle2 className="w-4 h-4" />
+          {isDetecting ? (
+            <RefreshCw className="w-4 h-4 animate-spin" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4" />
+          )}
           確認框選
         </button>
       </div>
@@ -555,31 +734,35 @@ export default function App() {
                           <div className="w-full flex flex-col gap-4">
                             <div className="relative rounded-xl overflow-hidden bg-slate-200 aspect-video w-full group">
                               <img 
-                                src={img.processedUrl!} 
-                                alt="處理後" 
+                                src={adjustingId === img.id ? img.originalUrl : img.processedUrl!} 
+                                alt={adjustingId === img.id ? "原圖" : "處理後"} 
                                 className="absolute inset-0 w-full h-full object-contain"
                               />
                               
-                              {/* Hover to see original */}
-                              <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                                <img 
-                                  src={img.originalUrl} 
-                                  alt="原圖" 
-                                  className="absolute inset-0 w-full h-full object-contain"
-                                />
-                                <div className="absolute top-3 left-3 bg-black/60 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded-md">
-                                  原圖
+                              {/* Hover to see original (only when not adjusting) */}
+                              {adjustingId !== img.id && (
+                                <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                                  <img 
+                                    src={img.originalUrl} 
+                                    alt="原圖" 
+                                    className="absolute inset-0 w-full h-full object-contain"
+                                  />
+                                  <div className="absolute top-3 left-3 bg-black/60 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded-md">
+                                    原圖
+                                  </div>
                                 </div>
+                              )}
+                              
+                              <div className={`absolute top-3 left-3 bg-red-600/90 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded-md transition-opacity duration-300 ${adjustingId === img.id ? 'opacity-100' : 'group-hover:opacity-0'}`}>
+                                {adjustingId === img.id ? '原圖 (微調中)' : '處理後'}
                               </div>
                               
-                              <div className="absolute top-3 left-3 bg-red-600/90 backdrop-blur-md text-white text-xs font-bold px-2.5 py-1 rounded-md group-hover:opacity-0 transition-opacity duration-300">
-                                處理後
-                              </div>
-                              
-                              <div className="absolute bottom-3 right-3 bg-black/60 backdrop-blur-md text-white text-xs font-medium px-2.5 py-1 rounded-md flex items-center gap-1.5 opacity-100 group-hover:opacity-0 transition-opacity duration-300">
-                                <SplitSquareHorizontal className="w-3.5 h-3.5" />
-                                懸停以對比
-                              </div>
+                              {adjustingId !== img.id && (
+                                <div className="absolute bottom-3 right-3 bg-black/60 backdrop-blur-md text-white text-xs font-medium px-2.5 py-1 rounded-md flex items-center gap-1.5 opacity-100 group-hover:opacity-0 transition-opacity duration-300">
+                                  <SplitSquareHorizontal className="w-3.5 h-3.5" />
+                                  懸停以對比
+                                </div>
+                              )}
                             </div>
                             
                             {adjustingId === img.id && img.width && img.height && (
@@ -598,16 +781,16 @@ export default function App() {
                                   <div className="flex flex-col gap-2">
                                     <div className="flex justify-between items-center">
                                       <label className="text-xs font-medium text-slate-600">大小 (Size)</label>
-                                      <span className="text-xs text-slate-500">{img.config?.size ?? (img.width > 1024 && img.height > 1024 ? 96 : 48)}px</span>
+                                      <span className="text-xs text-slate-500">{img.config?.size ?? (img.width >= 1536 && img.height >= 1536 ? 96 : 48)}px</span>
                                     </div>
                                     <input 
                                       type="range" 
                                       min="16" max="256" step="1"
-                                      value={img.config?.size ?? (img.width > 1024 && img.height > 1024 ? 96 : 48)} 
+                                      value={img.config?.size ?? (img.width >= 1536 && img.height >= 1536 ? 96 : 48)} 
                                       onChange={(e) => updateImageConfig(img.id, { 
                                         size: parseInt(e.target.value), 
-                                        marginRight: img.config?.marginRight ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32),
-                                        marginBottom: img.config?.marginBottom ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32)
+                                        marginRight: img.config?.marginRight ?? (img.width! >= 1536 && img.height! >= 1536 ? 64 : 32),
+                                        marginBottom: img.config?.marginBottom ?? (img.width! >= 1536 && img.height! >= 1536 ? 64 : 32)
                                       })}
                                       className="w-full accent-red-500"
                                     />
@@ -616,16 +799,16 @@ export default function App() {
                                   <div className="flex flex-col gap-2">
                                     <div className="flex justify-between items-center">
                                       <label className="text-xs font-medium text-slate-600">右邊距 (Margin Right)</label>
-                                      <span className="text-xs text-slate-500">{img.config?.marginRight ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)}px</span>
+                                      <span className="text-xs text-slate-500">{img.config?.marginRight ?? (img.width >= 1536 && img.height >= 1536 ? 64 : 32)}px</span>
                                     </div>
                                     <input 
                                       type="range" 
                                       min="0" max="256" step="1"
-                                      value={img.config?.marginRight ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)} 
+                                      value={img.config?.marginRight ?? (img.width >= 1536 && img.height >= 1536 ? 64 : 32)} 
                                       onChange={(e) => updateImageConfig(img.id, { 
-                                        size: img.config?.size ?? (img.width! > 1024 && img.height! > 1024 ? 96 : 48),
+                                        size: img.config?.size ?? (img.width! >= 1536 && img.height! >= 1536 ? 96 : 48),
                                         marginRight: parseInt(e.target.value),
-                                        marginBottom: img.config?.marginBottom ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32)
+                                        marginBottom: img.config?.marginBottom ?? (img.width! >= 1536 && img.height! >= 1536 ? 64 : 32)
                                       })}
                                       className="w-full accent-red-500"
                                     />
@@ -634,15 +817,15 @@ export default function App() {
                                   <div className="flex flex-col gap-2">
                                     <div className="flex justify-between items-center">
                                       <label className="text-xs font-medium text-slate-600">下邊距 (Margin Bottom)</label>
-                                      <span className="text-xs text-slate-500">{img.config?.marginBottom ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)}px</span>
+                                      <span className="text-xs text-slate-500">{img.config?.marginBottom ?? (img.width >= 1536 && img.height >= 1536 ? 64 : 32)}px</span>
                                     </div>
                                     <input 
                                       type="range" 
                                       min="0" max="256" step="1"
-                                      value={img.config?.marginBottom ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)} 
+                                      value={img.config?.marginBottom ?? (img.width >= 1536 && img.height >= 1536 ? 64 : 32)} 
                                       onChange={(e) => updateImageConfig(img.id, { 
-                                        size: img.config?.size ?? (img.width! > 1024 && img.height! > 1024 ? 96 : 48),
-                                        marginRight: img.config?.marginRight ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32),
+                                        size: img.config?.size ?? (img.width! >= 1536 && img.height! >= 1536 ? 96 : 48),
+                                        marginRight: img.config?.marginRight ?? (img.width! >= 1536 && img.height! >= 1536 ? 64 : 32),
                                         marginBottom: parseInt(e.target.value)
                                       })}
                                       className="w-full accent-red-500"

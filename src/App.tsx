@@ -1,7 +1,13 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Download, RefreshCw, Image as ImageIcon, Sparkles, ShieldCheck, Zap, Code, ArrowRight, CheckCircle2, AlertCircle, X, SplitSquareHorizontal } from 'lucide-react';
+import { Upload, Download, RefreshCw, Image as ImageIcon, Sparkles, ShieldCheck, Zap, Code, ArrowRight, CheckCircle2, AlertCircle, X, SplitSquareHorizontal, Settings } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { mask48, mask96 } from './masks';
+
+type WatermarkConfig = {
+  size: number;
+  marginRight: number;
+  marginBottom: number;
+};
 
 type ProcessedImage = {
   id: string;
@@ -10,10 +16,21 @@ type ProcessedImage = {
   processedUrl: string | null;
   status: 'pending' | 'processing' | 'completed' | 'error';
   aspectRatio?: string;
+  width?: number;
+  height?: number;
+  config?: WatermarkConfig;
+  version?: number;
 };
 
 // Helper to load base64 image into ImageData
+const maskCache = new Map<string, ImageData>();
+
 const loadMaskData = async (base64: string, size: number): Promise<ImageData> => {
+  const cacheKey = `${base64.substring(0, 20)}_${size}`;
+  if (maskCache.has(cacheKey)) {
+    return maskCache.get(cacheKey)!;
+  }
+
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -25,8 +42,10 @@ const loadMaskData = async (base64: string, size: number): Promise<ImageData> =>
         reject(new Error('Failed to get 2d context for mask'));
         return;
       }
-      ctx.drawImage(img, 0, 0);
-      resolve(ctx.getImageData(0, 0, size, size));
+      ctx.drawImage(img, 0, 0, size, size);
+      const imageData = ctx.getImageData(0, 0, size, size);
+      maskCache.set(cacheKey, imageData);
+      resolve(imageData);
     };
     img.onerror = reject;
     img.src = base64;
@@ -38,21 +57,23 @@ const loadMaskData = async (base64: string, size: number): Promise<ImageData> =>
 // 假設浮水印顏色為 W (通常是白色 255,255,255)，透明度為 alpha (例如 0.15)
 // 混合公式：Result = Original * (1 - alpha) + W * alpha
 // 反向推導：Original = (Result - W * alpha) / (1 - alpha)
-const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: number, height: number) => {
+const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: number, height: number, config?: WatermarkConfig) => {
   // 根據圖片尺寸判斷浮水印大小與邊距
   // W <= 1024 or H <= 1024 -> 48x48, 32px margin
   // W > 1024 and H > 1024 -> 96x96, 64px margin
   const isLarge = width > 1024 && height > 1024;
-  const watermarkSize = isLarge ? 96 : 48;
-  const margin = isLarge ? 64 : 32;
+  const watermarkSize = config?.size ?? (isLarge ? 96 : 48);
+  const marginRight = config?.marginRight ?? (isLarge ? 64 : 32);
+  const marginBottom = config?.marginBottom ?? (isLarge ? 64 : 32);
 
-  const x0 = width - watermarkSize - margin;
-  const y0 = height - watermarkSize - margin;
+  const x0 = width - watermarkSize - marginRight;
+  const y0 = height - watermarkSize - marginBottom;
 
   if (x0 < 0 || y0 < 0) return;
 
-  // 載入對應的 Mask
-  const maskImageData = await loadMaskData(isLarge ? mask96 : mask48, watermarkSize);
+  // 載入對應的 Mask (如果是自訂尺寸，我們用較大的 mask96 來縮放以保持品質)
+  const maskBase64 = watermarkSize > 48 ? mask96 : mask48;
+  const maskImageData = await loadMaskData(maskBase64, watermarkSize);
   const maskData = maskImageData.data;
 
   const imgData = ctx.getImageData(x0, y0, watermarkSize, watermarkSize);
@@ -86,6 +107,7 @@ const applyReverseAlphaBlending = async (ctx: CanvasRenderingContext2D, width: n
 export default function App() {
   const [images, setImages] = useState<ProcessedImage[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [adjustingId, setAdjustingId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -120,6 +142,7 @@ export default function App() {
       originalUrl: URL.createObjectURL(file),
       processedUrl: null,
       status: 'pending' as const,
+      version: 0,
     }));
     
     setImages(prev => [...newImages, ...prev]);
@@ -131,8 +154,22 @@ export default function App() {
     setImages(prev => prev.filter(img => img.id !== id));
   };
 
-  const processImage = async (imageObj: ProcessedImage) => {
-    setImages(prev => prev.map(img => img.id === imageObj.id ? { ...img, status: 'processing' } : img));
+  const updateImageConfig = (id: string, newConfig: WatermarkConfig) => {
+    setImages(prev => {
+      const img = prev.find(i => i.id === id);
+      if (img) {
+        const newVersion = (img.version || 0) + 1;
+        processImage({ ...img, config: newConfig, version: newVersion }, true);
+        return prev.map(i => i.id === id ? { ...i, config: newConfig, version: newVersion } : i);
+      }
+      return prev;
+    });
+  };
+
+  const processImage = async (imageObj: ProcessedImage, isUpdate = false) => {
+    if (!isUpdate) {
+      setImages(prev => prev.map(img => img.id === imageObj.id ? { ...img, status: 'processing' } : img));
+    }
     
     try {
       const img = new Image();
@@ -173,15 +210,22 @@ export default function App() {
       await new Promise(resolve => setTimeout(resolve, 10));
       
       // 使用反向 Alpha 混合演算法，完美還原像素
-      await applyReverseAlphaBlending(ctx, width, height);
+      await applyReverseAlphaBlending(ctx, width, height, imageObj.config);
 
       const processedUrl = canvas.toDataURL('image/png');
 
-      setImages(prev => prev.map(img => 
-        img.id === imageObj.id 
-          ? { ...img, status: 'completed', processedUrl, aspectRatio: aspectRatioStr } 
-          : img
-      ));
+      setImages(prev => {
+        const currentImg = prev.find(i => i.id === imageObj.id);
+        // 如果這個處理任務的版本已經過期（使用者又調整了滑桿），就放棄更新
+        if (currentImg && currentImg.version !== imageObj.version) {
+          return prev;
+        }
+        return prev.map(img => 
+          img.id === imageObj.id 
+            ? { ...img, status: 'completed', processedUrl, aspectRatio: aspectRatioStr, width, height } 
+            : img
+        );
+      });
 
     } catch (error) {
       console.error(error);
@@ -347,12 +391,23 @@ export default function App() {
                             </div>
                           </div>
                         </div>
-                        <button 
-                          onClick={() => removeImage(img.id)}
-                          className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
-                        >
-                          <X className="w-4 h-4" />
-                        </button>
+                        <div className="flex items-center gap-1">
+                          {img.status === 'completed' && (
+                            <button 
+                              onClick={() => setAdjustingId(adjustingId === img.id ? null : img.id)}
+                              className={`p-2 rounded-lg transition-colors ${adjustingId === img.id ? 'text-red-600 bg-red-50' : 'text-slate-400 hover:text-slate-900 hover:bg-slate-100'}`}
+                              title="微調浮水印位置"
+                            >
+                              <Settings className="w-4 h-4" />
+                            </button>
+                          )}
+                          <button 
+                            onClick={() => removeImage(img.id)}
+                            className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
 
                       <div className="p-6 flex-1 flex flex-col items-center justify-center relative min-h-[240px]">
@@ -397,6 +452,76 @@ export default function App() {
                               </div>
                             </div>
                             
+                            {adjustingId === img.id && img.width && img.height && (
+                              <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col gap-4 shadow-sm">
+                                <div className="flex items-center justify-between">
+                                  <h4 className="text-sm font-semibold text-slate-900 flex items-center gap-2">
+                                    <Settings className="w-4 h-4 text-slate-500" />
+                                    微調浮水印位置
+                                  </h4>
+                                  <button onClick={() => setAdjustingId(null)} className="text-slate-400 hover:text-slate-600">
+                                    <X className="w-4 h-4" />
+                                  </button>
+                                </div>
+                                
+                                <div className="grid grid-cols-1 gap-4">
+                                  <div className="flex flex-col gap-2">
+                                    <div className="flex justify-between items-center">
+                                      <label className="text-xs font-medium text-slate-600">大小 (Size)</label>
+                                      <span className="text-xs text-slate-500">{img.config?.size ?? (img.width > 1024 && img.height > 1024 ? 96 : 48)}px</span>
+                                    </div>
+                                    <input 
+                                      type="range" 
+                                      min="16" max="256" step="1"
+                                      value={img.config?.size ?? (img.width > 1024 && img.height > 1024 ? 96 : 48)} 
+                                      onChange={(e) => updateImageConfig(img.id, { 
+                                        size: parseInt(e.target.value), 
+                                        marginRight: img.config?.marginRight ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32),
+                                        marginBottom: img.config?.marginBottom ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32)
+                                      })}
+                                      className="w-full accent-red-500"
+                                    />
+                                  </div>
+                                  
+                                  <div className="flex flex-col gap-2">
+                                    <div className="flex justify-between items-center">
+                                      <label className="text-xs font-medium text-slate-600">右邊距 (Margin Right)</label>
+                                      <span className="text-xs text-slate-500">{img.config?.marginRight ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)}px</span>
+                                    </div>
+                                    <input 
+                                      type="range" 
+                                      min="0" max="256" step="1"
+                                      value={img.config?.marginRight ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)} 
+                                      onChange={(e) => updateImageConfig(img.id, { 
+                                        size: img.config?.size ?? (img.width! > 1024 && img.height! > 1024 ? 96 : 48),
+                                        marginRight: parseInt(e.target.value),
+                                        marginBottom: img.config?.marginBottom ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32)
+                                      })}
+                                      className="w-full accent-red-500"
+                                    />
+                                  </div>
+
+                                  <div className="flex flex-col gap-2">
+                                    <div className="flex justify-between items-center">
+                                      <label className="text-xs font-medium text-slate-600">下邊距 (Margin Bottom)</label>
+                                      <span className="text-xs text-slate-500">{img.config?.marginBottom ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)}px</span>
+                                    </div>
+                                    <input 
+                                      type="range" 
+                                      min="0" max="256" step="1"
+                                      value={img.config?.marginBottom ?? (img.width > 1024 && img.height > 1024 ? 64 : 32)} 
+                                      onChange={(e) => updateImageConfig(img.id, { 
+                                        size: img.config?.size ?? (img.width! > 1024 && img.height! > 1024 ? 96 : 48),
+                                        marginRight: img.config?.marginRight ?? (img.width! > 1024 && img.height! > 1024 ? 64 : 32),
+                                        marginBottom: parseInt(e.target.value)
+                                      })}
+                                      className="w-full accent-red-500"
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+
                             <button 
                               onClick={() => downloadImage(img.processedUrl!, img.originalFile.name)}
                               className="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl font-medium flex items-center justify-center gap-2 transition-colors"

@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Watermark Remover",
+  "description": "A web application to remove Gemini image watermarks, supporting 1:1, 4:5, 16:9, 9:16, and 5:4 aspect ratios.",
+  "requestFramePermissions": []
+}
